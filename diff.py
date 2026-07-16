@@ -50,7 +50,12 @@ class DiffMode(enum.Enum):
 
 # ==== COMMAND-LINE ====
 
-if __name__ == "__main__":
+parser: Optional[argparse.ArgumentParser] = None
+
+
+def main_early() -> None:
+    global parser
+
     # Prefer to use diff_settings.py from the current working directory
     sys.path.insert(0, ".")
     try:
@@ -145,9 +150,17 @@ if __name__ == "__main__":
         "--file",
         dest="file",
         type=str,
-        help="""File path for a file being diffed. When used the map
+        help="""File path for the file being diffed. When used the map
         file isn't searched for the function given. Useful for dynamically
         linked libraries.""",
+    )
+    parser.add_argument(
+        "-F",
+        "--ref-file",
+        dest="ref_file",
+        type=str,
+        help="""File path for the file being diffed against. Defaults to
+        expected/<diffed file>; normally you should never need to override this.""",
     )
     parser.add_argument(
         "-e",
@@ -400,6 +413,10 @@ if __name__ == "__main__":
     if argcomplete:
         argcomplete.autocomplete(parser)
 
+
+if __name__ == "__main__":
+    main_early()
+
 # ==== IMPORTS ====
 
 # (We do imports late to optimize auto-complete performance.)
@@ -469,6 +486,7 @@ class Config:
     # Build/objdump options
     diff_obj: bool
     file: Optional[str]
+    ref_file: Optional[str]
     make: bool
     source_old_binutils: bool
     diff_section: str
@@ -563,6 +581,7 @@ def create_config(args: argparse.Namespace, project: ProjectSettings) -> Config:
         # Build/objdump options
         diff_obj=args.diff_obj,
         file=args.file,
+        ref_file=args.ref_file,
         make=args.make,
         source_old_binutils=args.source_old_binutils
         or "llvm-" in project.objdump_executable,
@@ -689,8 +708,7 @@ class Text:
         return any(s for s, f in self.segments)
 
     def __str__(self) -> str:
-        # Use Formatter.apply(...) instead
-        return NotImplemented
+        raise NotImplementedError("Use Formatter.apply(...) instead")
 
     def __eq__(self, other: object) -> bool:
         return NotImplemented
@@ -923,12 +941,10 @@ class PythonFormatter(Formatter):
     arch_str: str
 
     def apply_format(self, chunk: str, f: Format) -> str:
-        # This method is unused by this formatter
-        return NotImplemented
+        raise NotImplementedError("apply_format does not apply to PythonFormatter")
 
     def table(self, data: TableData) -> str:
-        # This method is unused by this formatter
-        return NotImplemented
+        raise NotImplementedError("table does not apply to PythonFormatter")
 
     def raw(self, data: TableData) -> Dict[str, Any]:
         def serialize_format(s: str, f: Format) -> Dict[str, Any]:
@@ -1101,13 +1117,6 @@ def eval_int(expr: str, emsg: str) -> int:
     if ret is None:
         fail(emsg)
     return ret
-
-
-def eval_line_num(expr: str) -> Optional[int]:
-    expr = expr.strip().replace(":", "")
-    if expr == "":
-        return None
-    return int(expr, 16)
 
 
 def run_make(target: str, project: ProjectSettings) -> None:
@@ -1550,7 +1559,7 @@ def dump_objfile(
     if not os.path.isfile(objfile):
         fail(f"Not able to find .o file for function: {objfile} is not a file.")
 
-    refobjfile = os.path.join(project.expected_dir, objfile)
+    refobjfile = config.ref_file or os.path.join(project.expected_dir, objfile)
     if config.diff_mode != DiffMode.SINGLE and not os.path.isfile(refobjfile):
         fail(f'Please ensure an OK .o file exists at "{refobjfile}".')
 
@@ -1686,6 +1695,7 @@ class AsmProcessorMIPS(AsmProcessor):
 
     def is_end_of_function(self, mnemonic: str, args: str) -> bool:
         if self.seen_jr_ra:
+            self.seen_jr_ra = False
             return True
         if mnemonic == "jr" and args == "ra":
             self.seen_jr_ra = True
@@ -1867,15 +1877,27 @@ class AsmProcessorARM32(AsmProcessor):
             addr = int(addr_match.group(1), 16) if addr_match else -1
             entry_match = re.search(ARM32_JUMP_TABLE_ENTRY_PATTERN, line)
             if jump_table_entries > 0 and entry_match:
-                value = (
-                    entry_match.group(4)
-                    if is_hexstring(entry_match.group(4))
-                    else entry_match.group(2)
-                )
+                try:
+                    # Try parsing argument to .short/.word
+                    value = int(entry_match.group(4), 16)
+                except ValueError:
+                    # No luck; maybe it got disassembled to an instruction,
+                    # from which we need to read the instruction bytes instead.
+                    try:
+                        value = int(entry_match.group(2) or "", 16)
+                    except ValueError:
+                        # Something went wrong; avoid crashing. This has been
+                        # seen to happen in practice when we misparsed the asm
+                        # when searching for a cmp and ended up with the wrong
+                        # number of entries, after which we ran into a line with
+                        # a relocation rather than instruction bytes.
+                        jump_table_entries = 0
+                        break
+
                 table_entry = self.JumpTableEntry(
                     cur_addr=addr,
                     table_start_addr=table_start_addr,
-                    value=int(value, 16),
+                    value=value,
                     is_word=entry_match.group(3) == ".word",
                 )
                 jump_table_entries -= 2 if table_entry.is_word else 1
@@ -1897,7 +1919,10 @@ class AsmProcessorARM32(AsmProcessor):
         for i in reversed(range(line_no)):
             cmp_match = re.search(ARM32_COMPARE_IMM_PATTERN, raw_lines[i])
             if cmp_match:
-                value = immediate_to_int(cmp_match.group(2))
+                imm_match = re.match(r"#?(0x)?([0-9a-f]+)", cmp_match.group(2))
+                assert imm_match
+                base = 16 if imm_match.group(1) else 10
+                value = int(imm_match.group(2), base)
                 if value > 0:
                     return value + 1
         return 0
@@ -1968,13 +1993,13 @@ class AsmProcessorARM32(AsmProcessor):
                 continue
 
             # Add data symbol and its address to the line.
-            line_original = lines_by_line_number[line.data_pool_addr].original
+            value = "?"
+            if line.data_pool_addr in lines_by_line_number:
+                data_parts = lines_by_line_number[line.data_pool_addr].original.split()
+                if len(data_parts) > 1:
+                    value = data_parts[1]
             addr = "{:x}".format(line.data_pool_addr)
-            if line_original.strip():
-                value = line_original.split()[1]
-                line.original = line.normalized_original + f"={value} ({addr})"
-            else:
-                line.original = line.normalized_original + f"=? ({addr})"
+            line.original = line.normalized_original + f"={value} ({addr})"
 
     def post_process(self, lines: List["Line"]) -> None:
         self._post_process_jump_tables(lines)
@@ -2095,7 +2120,7 @@ class AsmProcessorX86(AsmProcessor):
         # Example %edi,0
         # Example movb $0x0,0x0
         if not addr_imm:
-            addr_imm = re.search(r"(?:0x)?(?<![1-9])0$", args)
+            addr_imm = re.search(r"\b(?:0x)?(?<![1-9])0$", args)
 
         # Example movb $0x0,0x0(%si)
         if not addr_imm:
@@ -3003,8 +3028,10 @@ X86_SETTINGS = ArchSettings(
         r"\%?\b(e?(?:(?:[sd]i|[sb]p)l?|[abcd][xhl])|[cdesfg]s|cr[0-7]|x?mm[0-7]|st)\b"
     ),
     re_large_imm=re.compile(r"-?[1-9][0-9]{2,}|-?0x[0-9a-f]{3,}"),
-    re_sprel=re.compile(r"-?(0x[0-9a-f]+|[0-9]+)(?=\((%ebp|%esi)\))"),
-    re_imm=re.compile(r"-?(0x[0-9a-f]+|[0-9]+)|([\?$_][^ \t,]+)"),
+    re_sprel=re.compile(r"(-?0x[0-9a-f]+|-?[0-9]+)(?=\((%ebp|%esi)\))"),
+    re_imm=re.compile(
+        r"(?:\b|-)(0x[0-9a-f]+|[0-9]+)|([\?$_][^ \t,]+)|(%(plt|got)\([^)]*\))"
+    ),
     re_reloc=re.compile(
         r"R_386_|dir32|DISP32|WRTSEG|OFF32|OFFPC32|OFF16|OFFPC16|SEG|FAR16"
     ),
@@ -3105,21 +3132,6 @@ ARCH_SETTINGS = [
 ]
 
 
-def immediate_to_int(immediate: str) -> int:
-    imm_match = re.match(r"#?(0x)?([0-9a-f]+)", immediate)
-    assert imm_match
-    base = 16 if imm_match.group(1) else 10
-    return int(imm_match.group(2), base)
-
-
-def is_hexstring(value: str) -> bool:
-    try:
-        int(value, 16)
-        return True
-    except ValueError:
-        return False
-
-
 def hexify_int(row: str, pat: Match[str], arch: ArchSettings) -> str:
     full = pat.group(0)
 
@@ -3196,6 +3208,7 @@ class Line:
     scorable_line: str
     symbol: Optional[str] = None
     line_num: Optional[int] = None
+    line_group: int = 0
     branch_target: Optional[int] = None
     data_pool_addr: Optional[int] = None
     source_filename: Optional[str] = None
@@ -3210,6 +3223,8 @@ def process(dump: str, config: Config) -> List[Line]:
     source_lines = []
     source_filename = None
     source_line_num = None
+    line_group = 0
+    prev_line_num = 0
     rets_remaining = config.stop_at_ret
 
     i = 0
@@ -3291,10 +3306,16 @@ def process(dump: str, config: Config) -> List[Line]:
             m_comment = re.search(arch.re_comment, row)
             comment = m_comment[0] if m_comment else None
             row = re.sub(arch.re_comment, "", row)
-            line_num_str = row.split(":")[0]
+            line_num_str = row.split(":")[0].strip()
             row = row.rstrip()
             tabs = row.split("\t")
-            line_num = eval_line_num(line_num_str.strip())
+            line_num = int(line_num_str, 16) if line_num_str else None
+
+            if line_num is not None:
+                if line_num < prev_line_num:
+                    line_group += 1
+
+                prev_line_num = line_num
 
             # TODO: use --no-show-raw-insn for all arches
             if "--no-show-raw-insn" in arch.arch_flags:
@@ -3435,6 +3456,7 @@ def process(dump: str, config: Config) -> List[Line]:
                 scorable_line=scorable_line,
                 symbol=symbol,
                 line_num=line_num,
+                line_group=line_group,
                 branch_target=branch_target,
                 data_pool_addr=data_pool_addr,
                 source_filename=source_filename,
@@ -3767,8 +3789,8 @@ def do_diff(lines1: List[Line], lines2: List[Line], config: Config) -> Diff:
     sc4 = symbol_formatter("my-stack", 4)
     sc5 = symbol_formatter("base-branch", 0)
     sc6 = symbol_formatter("my-branch", 0)
-    bts1: Set[int] = set()
-    bts2: Set[int] = set()
+    bts1: Set[Tuple[int, int]] = set()
+    bts2: Set[Tuple[int, int]] = set()
 
     if config.show_branches:
         for lines, btset, sc in [
@@ -3778,7 +3800,7 @@ def do_diff(lines1: List[Line], lines2: List[Line], config: Config) -> Diff:
             for line in lines:
                 bt = line.branch_target
                 if bt is not None:
-                    btset.add(bt)
+                    btset.add((line.line_group, bt))
                     sc(str(bt))
 
     lines1 = trim_nops(lines1, arch)
@@ -3940,7 +3962,7 @@ def do_diff(lines1: List[Line], lines2: List[Line], config: Config) -> Diff:
             out: Text,
             line: Optional[Line],
             line_color: Format,
-            btset: Set[int],
+            btset: Set[Tuple[int, int]],
             sc: FormatFunction,
         ) -> Optional[Text]:
             if line is None:
@@ -3950,7 +3972,7 @@ def do_diff(lines1: List[Line], lines2: List[Line], config: Config) -> Diff:
             in_arrow = Text("  ")
             out_arrow = Text()
             if config.show_branches:
-                if line.line_num in btset:
+                if (line.line_group, line.line_num) in btset:
                     in_arrow = Text("~>", sc(str(line.line_num)))
                 if line.branch_target is not None:
                     out_arrow = " " + Text("~>", sc(str(line.branch_target)))
@@ -4108,7 +4130,7 @@ def align_diffs(old_diff: Diff, new_diff: Diff, config: Config) -> TableData:
         old_chunks = chunk_diff_lines(old_diff.lines)
         new_chunks = chunk_diff_lines(new_diff.lines)
         diff_lines = []
-        empty = OutputLine(Text(), Text(), None, True, False, None, None)
+        empty = OutputLine(Text(), Text(), None, False, False, None, None)
         assert len(old_chunks) == len(new_chunks), "same target"
         for old_chunk, new_chunk in zip(old_chunks, new_chunks):
             if isinstance(old_chunk, list):
@@ -4217,7 +4239,7 @@ def debounced_fs_watch(
 
         def should_notify(self, path: str) -> bool:
             for target in self.file_targets:
-                if os.path.normpath(path) == target:
+                if os.path.abspath(path) == target:
                     return True
             if config.make and any(
                 path.endswith(suffix) for suffix in project.source_extensions
@@ -4239,7 +4261,7 @@ def debounced_fs_watch(
             if os.path.isdir(target):
                 observer.schedule(event_handler, target, recursive=True)  # type: ignore
             else:
-                file_targets.append(os.path.normpath(target))
+                file_targets.append(os.path.abspath(target))
                 target = os.path.dirname(target) or "."
                 if target not in observed:
                     observed.add(target)
@@ -4403,8 +4425,11 @@ class Display:
         self.ready_queue.get()
 
 
-def main() -> None:
+def main_late() -> None:
+    assert parser is not None, "set by main_early"
     args = parser.parse_args()
+
+    import diff_settings
 
     # Apply project-specific configuration.
     settings: Dict[str, Any] = {}
@@ -4520,5 +4545,10 @@ def main() -> None:
             display.terminate()
 
 
+def main() -> None:
+    main_early()
+    main_late()
+
+
 if __name__ == "__main__":
-    main()
+    main_late()
